@@ -16,6 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 pub(crate) mod ahead;
+mod detile_gpu;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

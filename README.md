@@ -76,7 +76,22 @@ scratch buffer and releases oversized buffers after a query. To compare
 against the previous caller-thread behavior, launch with
 `VICTORY_UMA_WATCH_THREAD=0`.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:ca24d9b1deb49fa3ca7c01fa958ade06adc11c073ab3a43807d8354be98cbdb7 -->
+
+### GPU texture detiling (experimental)
+
+Set `VICTORY_GPU_DETILE=1` to let the background upload workers rearrange
+eligible tiled 2D textures on the GPU before their first use. This also
+enables background uploads unless `VICTORY_UPLOAD_AHEAD=0` is set. The log
+reports when a texture is detiled on the GPU. Partly mapped textures and
+unsupported layouts still use CPU detiling. DirectStorage zlib and BCPack
+still decode into CPU-visible title memory.
+
 ### Windows
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 <!-- /coderabbit-ai-generated:v1 -->
 

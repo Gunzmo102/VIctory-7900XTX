@@ -1,4 +1,4 @@
-//! First uploads of textures picked by index on a copy queue of their own
+//! First uploads of textures picked by index on a queue of their own
 //! (`VICTORY_UPLOAD_AHEAD`): read, detiled and copied by threads of ours as
 //! soon as the texture pass has made them, and the slots that wait for them
 //! shown when the copy has run. Recorded into the pass's list, as every other
@@ -9,7 +9,8 @@
 //! Only a texture that no list has used is taken: made in the last second,
 //! in the common state, and never asked for an upload before
 //! ([`crate::resource::HostTexture::ahead`]). It stays in the common state
-//! (a copy queue's copies leave it there), from which the card's shaders read
+//! (copy queue decay or an explicit transition after GPU detiling),
+//! from which the card's shaders read
 //! it as any texture.
 
 use std::collections::VecDeque;
@@ -19,7 +20,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
-use super::Staging;
+use super::{Staging, detile_gpu};
+use crate::host::transition;
 use crate::object::This;
 use crate::resource::HostTexture;
 
@@ -43,7 +45,9 @@ pub(crate) fn on() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_UPLOAD_AHEAD").map_or_else(detile_gpu::enabled, |v| v != "0")
+    })
 }
 
 /// An upload on its way.
@@ -82,6 +86,7 @@ static QUEUE: (Mutex<VecDeque<Arc<Job>>>, Condvar) = (Mutex::new(VecDeque::new()
 static ON_THEIR_WAY: Mutex<Vec<(u64, Arc<Job>)>> = Mutex::new(Vec::new());
 static LANDED: Condvar = Condvar::new();
 static BYTES: AtomicU64 = AtomicU64::new(0);
+static DECODED: AtomicU64 = AtomicU64::new(0);
 /// Since the start: uploads, bytes, microseconds from the asking until the
 /// copy had run, the longest; askings turned down; waits of lists.
 static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -168,17 +173,26 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
     WORKERS
         .get_or_init(|| {
             let host = crate::host::host()?;
+            let pass = detile_gpu::enabled().then(|| detile_gpu::pass(host)).flatten();
+            if detile_gpu::enabled() && pass.is_none() {
+                tracing::warn!("GPU detile pipeline unavailable; using CPU detiling");
+            }
+            let kind = if pass.is_some() {
+                D3D12_COMMAND_LIST_TYPE_DIRECT
+            } else {
+                D3D12_COMMAND_LIST_TYPE_COPY
+            };
             // SAFETY: plain object creation.
             let queue: ID3D12CommandQueue = unsafe {
                 host.device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                        Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                        Type: kind,
                         ..Default::default()
                     })
                     .ok()?
             };
             for n in 0..2 {
-                let worker = Worker::new(&host.device, queue.clone()).ok()?;
+                let worker = Worker::new(&host.device, queue.clone(), kind, pass).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }
             Some(Queue(queue))
@@ -192,24 +206,32 @@ struct Worker {
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
+    detile_pass: Option<&'static detile_gpu::Pass>,
+    scratch: Option<detile_gpu::Scratch>,
 }
 
 // SAFETY: a worker's objects are its thread's own; the queue is free-threaded.
 unsafe impl Send for Worker {}
 
 impl Worker {
-    fn new(device: &ID3D12Device, queue: ID3D12CommandQueue) -> windows::core::Result<Worker> {
+    fn new(
+        device: &ID3D12Device, queue: ID3D12CommandQueue, kind: D3D12_COMMAND_LIST_TYPE,
+        detile_pass: Option<&'static detile_gpu::Pass>,
+    ) -> windows::core::Result<Worker> {
         // SAFETY: plain object creation.
         unsafe {
-            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(kind)?;
             let list: ID3D12GraphicsCommandList =
-                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                device.CreateCommandList(0, kind, &allocator, None)?;
             list.Close()?;
-            Ok(Worker { queue, allocator, list, fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? })
+            Ok(Worker {
+                queue, allocator, list, fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
+                detile_pass, scratch: None,
+            })
         }
     }
 
-    fn work(self) {
+    fn work(mut self) {
         let mut value = 0;
         let mut jobs = Vec::with_capacity(BATCH.1);
         loop {
@@ -235,17 +257,34 @@ impl Worker {
         }
     }
 
-    fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
-        for job in jobs {
-            job.staging.refresh();
+    fn copy(&mut self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
+        // The worker has one reusable input/output pair, so offload one
+        // texture per batch. Others can be prepared as before.
+        let gpu_job = self.detile_pass.and_then(|_| {
+            jobs.iter().position(|job| detile_gpu::Scratch::prepare(&mut self.scratch, &job.staging).is_some())
+        });
+        for (i, job) in jobs.iter().enumerate() {
+            if Some(i) != gpu_job {
+                job.staging.refresh();
+            }
         }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
-            for job in jobs {
-                job.record(&self.list);
+            for (i, job) in jobs.iter().enumerate() {
+                if Some(i) == gpu_job
+                    && let (Some(pass), Some(scratch)) = (self.detile_pass, self.scratch.as_ref())
+                {
+                    scratch.record(&self.list, pass);
+                    job.record(&self.list, Some(&scratch.output), true);
+                    self.list.ResourceBarrier(&[transition(
+                        &scratch.output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                } else {
+                    job.record(&self.list, None, self.detile_pass.is_some());
+                }
             }
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
@@ -259,6 +298,12 @@ impl Worker {
                 ));
             }
         }
+        if gpu_job.is_some() {
+            let n = DECODED.fetch_add(1, Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(1000) {
+                tracing::info!(textures = n, "textures detiled on the GPU");
+            }
+        }
         Ok(())
     }
 }
@@ -266,8 +311,16 @@ impl Worker {
 impl Job {
     /// # Safety
     /// `list` is an open copy list, and the job lives until it has run.
-    unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
+    unsafe fn record(
+        &self, list: &ID3D12GraphicsCommandList, decoded: Option<&ID3D12Resource>, direct: bool,
+    ) {
         let (s, texture) = (&self.staging, &self.copy.texture);
+        let (buffer, base) = decoded.map_or((&s.buffer, s.base), |buffer| (buffer, 0));
+        if direct {
+            // SAFETY: this is a fresh texture; the direct list makes both
+            // transitions explicit rather than relying on copy-queue decay.
+            unsafe { list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]) };
+        }
         for (i, footprint) in s.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -277,14 +330,18 @@ impl Job {
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&s.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: s.base + footprint.Offset, ..*footprint },
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + footprint.Offset, ..*footprint },
                 },
             };
             // SAFETY: the caller's.
             unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+        if direct {
+            // SAFETY: just transitioned and copied; later queues see COMMON.
+            unsafe { list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]) };
         }
     }
 }
@@ -348,9 +405,14 @@ mod tests {
     #[test]
     fn a_placed_texture_is_filled_ahead_of_the_lists() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        let Some(host) = crate::host::host() else { return };
-        // 256x256 BC7, nine levels.
-        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let Some(host) = crate::host::host() else {
+            assert!(!detile_gpu::enabled(), "GPU detile test needs a D3D12 adapter");
+            return;
+        };
+        // 512x512 BC7, nine levels: large enough for the GPU path.
+        // Run this test alone with VICTORY_GPU_DETILE=1 to check the
+        // compute upload against the CPU detiler on a D3D12 adapter.
+        let desc = [3u32, 0, 0, 0, 512, 0, 512, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
         let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
         // SAFETY: memory of our own that stays.
         let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
@@ -360,6 +422,7 @@ mod tests {
         crate::resource::want_level(texture, 0);
         let copy = crate::resource::host_copy(texture).unwrap();
         if !crate::pool::fresh(&copy.texture) {
+            assert!(!detile_gpu::enabled(), "GPU detile test needs a fresh texture");
             return;
         }
         assert!(!there(texture));
@@ -370,15 +433,19 @@ mod tests {
         assert!(Arc::ptr_eq(&job, &same));
         job.then(move || told.send(1).unwrap());
         same.then(move || also.send(2).unwrap());
+        let gpu_before = DECODED.load(Relaxed);
         send(&job);
         let wait = std::time::Duration::from_secs(20);
         assert_eq!((heard.recv_timeout(wait), heard.recv_timeout(wait)), (Ok(1), Ok(2)));
         assert!(there(texture) && claim(texture, 0, u64::MAX).is_none());
+        if detile_gpu::enabled() {
+            assert!(DECODED.load(Relaxed) > gpu_before, "GPU detile fell back to the CPU");
+        }
         // Level 0 as the card has it, and as the layout says.
         let layout = crate::resource::texture_memory(texture)
             .and_then(|(_, d)| crate::resource::texture_layout(&d).map(|t| t.planes[0].layout.clone()))
             .unwrap();
-        let (pitch, rows) = (1024usize, 64usize);
+        let (pitch, rows) = (2048usize, 128usize);
         let mut expected = vec![0u8; pitch * rows];
         // SAFETY: the memory above.
         let tiled = unsafe { std::slice::from_raw_parts(at, whole) };
@@ -391,8 +458,8 @@ mod tests {
             Offset: 0,
             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                 Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(98),
-                Width: 256,
-                Height: 256,
+                Width: 512,
+                Height: 512,
                 Depth: 1,
                 RowPitch: pitch as u32,
             },
