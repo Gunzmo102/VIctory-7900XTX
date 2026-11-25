@@ -3636,6 +3636,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod readback;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -4552,7 +4553,6 @@ impl Host {
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
         if let (Some(fetch), Some(first)) = (fetch.as_mut(), plans.iter().map(|p| p.1).min()) {
             fetch.had.landing(first);
         }
@@ -4602,8 +4602,7 @@ impl Host {
                                 upcheck::fetched(r.shadow.id(), lo);
                             }
                             seen.insert((copy, lo, hi));
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                            pieces.push((r.shadow.clone(), lo, hi, 0));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -4614,19 +4613,31 @@ impl Host {
             // In the order they are landed, each byte of a copy once.
             let keys: Vec<land::Piece> =
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)).collect();
-            total = 0;
             pieces = land::ordered(&keys)
                 .into_iter()
                 .map(|(i, title, len)| {
                     let shadow = &pieces[i].0;
                     let lo = title - shadow.span().0 as usize;
-                    let at = total;
-                    total += len as u64;
-                    (shadow.clone(), lo, lo + len, at)
+                    (shadow.clone(), lo, lo + len, 0)
                 })
                 .collect();
         }
         land::spent(land::stat::GATHER, gathering);
+        // The sends these flights ran behind, all a fetch on the copy queue
+        // is known to have run behind.
+        let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+        if pieces.is_empty() {
+            // No need to create a command list, queue or fence yet. If the
+            // future fetch might use the copy queue, keep the conservative
+            // watermark until its queue is known.
+            let after = if fetch.as_ref().map_or_else(relay_copy, |f| f.queue.is_some()) {
+                behind
+            } else {
+                *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+            };
+            crate::shadow::relay_fetched(after);
+            return;
+        }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
@@ -4634,25 +4645,24 @@ impl Host {
         // fetched: the pieces come down whole, to be hashed.
         let check = (torn::on() && fetch.as_ref().is_some_and(|f| f.queue.is_some()))
             .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
-        if let Some(check) = &check {
-            total = check.total;
-        }
+        let (total, coalesced) = if let Some(check) = &check {
+            (check.total, None)
+        } else {
+            let fetch = readback::fetch(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), *lo, *hi)));
+            for ((_, _, _, at), &offset) in pieces.iter_mut().zip(&fetch.offsets) {
+                *at = offset;
+            }
+            (fetch.bytes, Some(fetch.copies))
+        };
         #[cfg(feature = "diagnostics")]
-        for (shadow, lo, hi, _) in &pieces {
-            traffic::moved(traffic::FETCHED, shadow.span(), std::iter::once((*lo, *hi)));
-        }
-        // The sends these flights ran behind, all a fetch on the copy queue
-        // is known to have run behind.
-        let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
-        if pieces.is_empty() {
-            // Nothing to fetch: every send so far is older than the next
-            // fetch, if that goes to the queue the sends went to.
-            let after = match fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
-                true => behind,
-                false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
-            };
-            crate::shadow::relay_fetched(after);
-            return;
+        if let Some(copies) = &coalesced {
+            for copy in copies {
+                traffic::moved(traffic::FETCHED, pieces[copy.request].0.span(), std::iter::once((copy.from, copy.to)));
+            }
+        } else if let Some(check) = &check {
+            for (shadow, lo, hi, _) in &check.copies {
+                traffic::moved(traffic::FETCHED, shadow.span(), std::iter::once((*lo, *hi)));
+            }
         }
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
@@ -4681,8 +4691,17 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                if let Some(copies) = &coalesced {
+                    for copy in copies {
+                        let shadow = &pieces[copy.request].0;
+                        list.CopyBufferRegion(
+                            &buffer, copy.offset, &shadow.buffer, copy.from as u64, (copy.to - copy.from) as u64,
+                        );
+                    }
+                } else if let Some(check) = &check {
+                    for (shadow, lo, hi, at) in &check.copies {
+                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -4955,7 +4974,6 @@ impl Host {
         // The pieces to fetch: the range, the offsets in its copy, and
         // where the bytes come down.
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
         plan.picked_found(differs);
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
             for p in 0..r.span.pieces {
@@ -4964,14 +4982,18 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
-                    total += (hi - lo) as u64;
+                    pieces.push((i, lo, hi, 0));
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
+            let fetch = readback::fetch(pieces.iter().map(|&(i, lo, hi, _)| (plan.ranges[i].shadow.id(), lo, hi)));
+            let total = fetch.bytes;
+            for ((_, _, _, at), offset) in pieces.iter_mut().zip(fetch.offsets) {
+                *at = offset;
+            }
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
                 work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
@@ -4987,8 +5009,11 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
+                    for copy in &fetch.copies {
+                        let i = pieces[copy.request].0;
+                        list.CopyBufferRegion(
+                            fetched, copy.offset, &plan.ranges[i].shadow.buffer, copy.from as u64, (copy.to - copy.from) as u64,
+                        );
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
