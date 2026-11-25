@@ -1630,6 +1630,37 @@ impl HostHeap {
     }
 }
 
+/// Reusable cache-sized source for null descriptor runs in draw tables.
+const NULL_TABLE_CHUNK: u32 = 256;
+
+fn null_table_block() -> Option<&'static ID3D12DescriptorHeap> {
+    static BLOCK: std::sync::OnceLock<Option<ID3D12DescriptorHeap>> = std::sync::OnceLock::new();
+    BLOCK.get_or_init(|| {
+        if std::env::var_os("VICTORY_VIEW_COPY").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let host = host()?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        // SAFETY: plain creation; this initialization owns the entire CPU heap.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind, NumDescriptors: NULL_TABLE_CHUNK, ..Default::default()
+            }).ok()?;
+            let first = heap.GetCPUDescriptorHandleForHeapStart();
+            let step = host.device.GetDescriptorHandleIncrementSize(kind) as usize;
+            null_view(first);
+            let mut filled = 1;
+            while filled < NULL_TABLE_CHUNK {
+                let count = filled.min(NULL_TABLE_CHUNK - filled);
+                let dst = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: first.ptr + filled as usize * step };
+                host.device.CopyDescriptorsSimple(count, dst, first, kind);
+                filled += count;
+            }
+            Some(heap)
+        }
+    }).as_ref()
+}
+
 /// A plain point sampler at `at`.
 fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
@@ -2625,6 +2656,45 @@ impl HostHeap {
         }
         self.clear_twin(index);
         self.keep(index, None);
+    }
+
+    /// Nulls a contiguous run of a draw table it exclusively owns.
+    /// The main descriptors are copied together; raw twins and resource
+    /// references still follow the same cleanup as a single null slot.
+    pub(crate) fn null_table_run(&self, start: u32, end: u32) {
+        debug_assert!(!self.sampler && self.count <= start && end <= self.count + self.dynamic);
+        if end - start < 2 || self.sampler {
+            for index in start..end {
+                self.make_null(index);
+            }
+            return;
+        }
+        let (Some(host), Some(block)) = (host(), null_table_block()) else {
+            for index in start..end {
+                self.make_null(index);
+            }
+            return;
+        };
+        // SAFETY: the cached CPU-only block is immutable, and only this
+        // recording owns the destination until the table is submitted.
+        let source = unsafe { block.GetCPUDescriptorHandleForHeapStart() };
+        let mut at = start;
+        while at < end {
+            let count = (end - at).min(NULL_TABLE_CHUNK);
+            // SAFETY: the handles and count refer to slots in the two heaps.
+            unsafe { host.device.CopyDescriptorsSimple(count, self.cpu(at), source, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+            #[cfg(feature = "diagnostics")]
+            let now = crate::host::coarse_ms() as u32;
+            for index in at..at + count {
+                #[cfg(feature = "diagnostics")]
+                if let Some(written) = self.written.get(index as usize) {
+                    written.store(now, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.clear_twin(index);
+                self.keep(index, None);
+            }
+            at += count;
+        }
     }
 
     /// Where the raw twin of slot `index` is made.
@@ -4347,17 +4417,38 @@ impl Copied<'_> {
 /// Most of a changed page is as it was: it is looked at sixteen records at a
 /// time.
 fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    // Fixed shader-heap record sizes let the compiler compare without a
+    // runtime-sized comparison call for every slot.
+    match step {
+        16 => changed_runs::<16>(last, records, step, first, out),
+        32 => changed_runs::<32>(last, records, step, first, out),
+        _ => changed_runs::<0>(last, records, step, first, out),
+    }
+}
+
+fn changed_runs<const STEP: usize>(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    let step = if STEP == 0 { step } else { STEP };
     const AT_A_TIME: usize = 16;
     let block = AT_A_TIME * step;
     for (b, (old, new)) in last.chunks_mut(block).zip(records.chunks(block)).enumerate() {
         if old == new {
             continue;
         }
-        for (n, (old, new)) in old.chunks_exact_mut(step).zip(new.chunks_exact(step)).enumerate() {
+        // Find the runs before writing the snapshot. A raw copy often
+        // changes consecutive records; write that span once from cache.
+        let mut changed = 0u16;
+        for (n, (old, new)) in old.chunks_exact(step).zip(new.chunks_exact(step)).enumerate() {
             if old != new {
-                old.copy_from_slice(new);
+                changed |= 1 << n;
                 out.push(first + (b * AT_A_TIME + n) as u32);
             }
+        }
+        while changed != 0 {
+            let from = changed.trailing_zeros() as usize;
+            let len = (changed >> from).trailing_ones() as usize;
+            let end = from + len;
+            old[from * step..end * step].copy_from_slice(&new[from * step..end * step]);
+            changed = ((u32::from(changed) >> end) << end) as u16;
         }
     }
 }
@@ -4365,6 +4456,22 @@ fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out
 #[cfg(test)]
 mod changed_records_tests {
     use super::changed_records;
+
+    #[test]
+    fn consecutive_snapshot_writes_preserve_slot_order_and_partial_record() {
+        const STEP: usize = 32;
+        let mut last = vec![0; 41 * STEP + 7];
+        let mut records = last.clone();
+        records[..18 * STEP].fill(1);
+        records[25 * STEP..41 * STEP].fill(2);
+        records[41 * STEP..].fill(3);
+        let mut out = Vec::new();
+        changed_records(&mut last, &records, STEP, 17, &mut out);
+        let expected: Vec<u32> = (17..35).chain(42..58).collect();
+        assert_eq!(out, expected);
+        assert_eq!(last[..41 * STEP], records[..41 * STEP]);
+        assert_eq!(&last[41 * STEP..], &[0; 7]);
+    }
 
     #[test]
     fn changed_records_are_those_that_differ_one_by_one() {
@@ -5399,6 +5506,25 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn null_table_chunks_release_only_their_slot_resources() {
+        let (Some(host), Some(heap)) = (host(), HostHeap::new(false, 4)) else {
+            eprintln!("no D3D12 adapter; skipped descriptor copy");
+            return;
+        };
+        let buffer = host.upload_buffer(256).unwrap().0;
+        let count = NULL_TABLE_CHUNK + 5;
+        let first = heap.dynamic(count + 2).unwrap();
+        for index in first..first + count + 2 {
+            heap.raw_at(index, &buffer, 0, 256);
+            assert!(heap.kept_in(index).is_some());
+        }
+        heap.null_table_run(first + 1, first + count + 1);
+        assert!(heap.kept_in(first).is_some());
+        assert!(heap.kept_in(first + count + 1).is_some());
+        assert!((first + 1..first + count + 1).all(|i| heap.kept_in(i).is_none()));
     }
 
     #[test]

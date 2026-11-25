@@ -3324,6 +3324,12 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            let mut null_start = None;
+            let flush_null = |pending: &mut Option<u32>, end| {
+                if let Some(start) = pending.take() {
+                    host.null_table_run(start, end);
+                }
+            };
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3334,6 +3340,7 @@ impl State {
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
+                    flush_null(&mut null_start, index);
                     let kind = entries()
                         .find(|u| u.table_offset_dwords / 8 == k)
                         .map(|u| u.kind)
@@ -3374,14 +3381,16 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
+                            null_start.get_or_insert(index);
                             continue;
                         };
+                        flush_null(&mut null_start, index);
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
+                        flush_null(&mut null_start, index);
                         host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
@@ -3404,13 +3413,14 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        null_start.get_or_insert(index);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
                 }
             }
+            flush_null(&mut null_start, first + n);
             made.push((slot, first * 32));
         }
         made
