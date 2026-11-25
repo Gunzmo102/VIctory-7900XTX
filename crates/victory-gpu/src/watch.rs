@@ -54,30 +54,128 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
+type PageMap<T> = std::collections::HashMap<usize, T, std::hash::BuildHasherDefault<PageHash>>;
+
+/// Sixteen write numbers with their common high bits stored once. Keep the
+/// full numbers separately for pages that straddle a 32-bit epoch boundary.
+struct PackedParts {
+    high: u32,
+    low: [u32; PARTS],
+}
+
+impl PackedParts {
+    fn number(high: u32, low: u32) -> u64 {
+        (u64::from(high) << 32) | u64::from(low)
+    }
+
+    fn pack(all: &[u64; PARTS], high: u32) -> Option<Self> {
+        all.iter().all(|&at| (at >> 32) as u32 == high)
+            .then(|| Self { high, low: all.map(|at| at as u32) })
+    }
+
+    fn unpack(&self) -> [u64; PARTS] {
+        self.low.map(|low| Self::number(self.high, low))
+    }
+
+    fn since(&self, taken: u64) -> u16 {
+        use std::cmp::Ordering;
+        match self.high.cmp(&((taken >> 32) as u32)) {
+            Ordering::Less => 0,
+            Ordering::Greater => WHOLE,
+            Ordering::Equal => mask_since(&self.low, taken as u32),
+        }
+    }
+}
+
+fn mask_since<T: Ord>(all: &[T; PARTS], taken: T) -> u16 {
+    all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k)
+}
+
+fn set_parts<T: Copy>(all: &mut [T; PARTS], mut mask: u16, now: T) {
+    while mask != 0 {
+        all[mask.trailing_zeros() as usize] = now;
+        mask &= mask - 1;
+    }
+}
+
+struct PartHistory {
+    packed: PageMap<PackedParts>,
+    wide: PageMap<[u64; PARTS]>,
+}
+
+impl PartHistory {
+    const fn new() -> Self {
+        Self {
+            packed: PageMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            wide: PageMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        }
+    }
+
+    fn forget(&mut self, page: usize) {
+        if self.packed.remove(&page).is_none() {
+            self.remove_wide(page);
+        }
+    }
+
+    fn remove_wide(&mut self, page: usize) {
+        // Release the wide allocation when its last entry goes away.
+        if self.wide.remove(&page).is_some() && self.wide.is_empty() {
+            self.wide = PageMap::with_hasher(std::hash::BuildHasherDefault::new());
+        }
+    }
+
+    fn note(&mut self, page: usize, mask: u16, before: u64, now: u64) {
+        let high = (now >> 32) as u32;
+        if let Some(packed) = self.packed.get_mut(&page)
+            && packed.high == high
+        {
+            set_parts(&mut packed.low, mask, now as u32);
+            return;
+        }
+        if let Some(wide) = self.wide.get_mut(&page) {
+            set_parts(wide, mask, now);
+            if let Some(packed) = PackedParts::pack(wide, high) {
+                self.remove_wide(page);
+                self.packed.insert(page, packed);
+            }
+            return;
+        }
+        let mut all = self.packed.remove(&page).map_or([before; PARTS], |packed| packed.unpack());
+        set_parts(&mut all, mask, now);
+        if let Some(packed) = PackedParts::pack(&all, high) {
+            self.packed.insert(page, packed);
+        } else {
+            self.wide.insert(page, all);
+        }
+    }
+
+    fn since(&self, page: usize, taken: u64) -> u16 {
+        if let Some(packed) = self.packed.get(&page) {
+            packed.since(taken)
+        } else if let Some(wide) = self.wide.get(&page) {
+            mask_since(wide, taken)
+        } else {
+            WHOLE
+        }
+    }
+}
+
 impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.insert(page, now).unwrap_or(0);
         if parts == WHOLE || !parts_on() {
-            self.parts.remove(&page);
-            return before;
-        }
-        let all = self.parts.entry(page).or_insert([before; PARTS]);
-        for (k, at) in all.iter_mut().enumerate() {
-            if parts >> k & 1 != 0 {
-                *at = now;
-            }
+            self.parts.forget(page);
+        } else {
+            self.parts.note(page, parts, before, now);
         }
         before
     }
 
     /// The parts of `page` written by an asking after `taken`.
     fn parts_since(&self, page: usize, taken: u64) -> u16 {
-        match self.parts.get(&page) {
-            Some(all) => all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k),
-            None => WHOLE,
-        }
+        self.parts.since(page, taken)
     }
 }
 
@@ -124,7 +222,7 @@ struct Journal {
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
-    parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+    parts: PartHistory,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
@@ -144,7 +242,7 @@ struct Journal {
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
-    parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    parts: PartHistory::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
@@ -2720,10 +2818,41 @@ mod parts_tests {
     use super::*;
 
     #[test]
+    fn packing_preserves_masks_across_epoch_boundaries() {
+        assert_eq!(std::mem::size_of::<PackedParts>(), 68);
+        let mut history = PartHistory::new();
+        let edge = 1u64 << 32;
+        history.note(7, 0b11, edge - 4, edge - 2);
+        assert_eq!(history.since(7, edge - 3), 0b11);
+        assert!(history.packed.contains_key(&7));
+
+        history.note(7, 0b1, edge - 2, edge);
+        assert!(history.wide.contains_key(&7));
+        assert_eq!(history.since(7, edge - 3), 0b11);
+        assert_eq!(history.since(7, edge - 2), 0b1);
+        assert_eq!(history.since(7, edge), 0);
+
+        history.note(7, WHOLE ^ 0b1, edge, edge + 1);
+        assert!(history.packed.contains_key(&7));
+        assert_eq!(history.wide.capacity(), 0);
+        assert_eq!(history.since(7, edge - 1), WHOLE);
+        assert_eq!(history.since(7, edge), WHOLE ^ 0b1);
+        assert_eq!(history.since(7, edge << 1), 0);
+
+        // Untouched parts of a new page still have write number zero,
+        // even when the first write is in a later epoch.
+        history.note(8, 0b100, 0, edge + 1);
+        assert_eq!(history.since(8, 0), 0b100);
+        history.forget(8);
+        assert_eq!(history.wide.capacity(), 0);
+        assert_eq!(history.since(8, edge), WHOLE);
+    }
+
+    #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
             written: BTreeMap::new(),
-            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            parts: PartHistory::new(),
             ahead: Vec::new(),
             ahead_asked: 0,
             kept: false,
