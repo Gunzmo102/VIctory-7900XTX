@@ -336,6 +336,7 @@ impl Drop for Asking {
 }
 
 type WatchAnswer = Option<Vec<(usize, u16)>>;
+type WatchAddress = *mut std::ffi::c_void;
 
 struct WatchRequest {
     first: usize,
@@ -364,7 +365,7 @@ fn watch_worker() -> Option<&'static std::sync::mpsc::SyncSender<WatchRequest>> 
                 let _ = request.reply.send(answer);
                 // A very large one-off query should not leave its scratch
                 // allocation resident for the lifetime of the worker.
-                if found.capacity() > (2 << 20) / std::mem::size_of::<usize>() {
+                if found.capacity() > (2 << 20) / std::mem::size_of::<WatchAddress>() {
                     found = Vec::new();
                 }
             }
@@ -393,18 +394,20 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         }
     }
     thread_local! {
-        static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+        static FOUND: std::cell::RefCell<Vec<WatchAddress>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     FOUND.with(|found| kernel_written_in(first, last, &mut found.borrow_mut()))
 }
 
-fn kernel_written_in(first: usize, last: usize, found: &mut Vec<usize>) -> WatchAnswer {
+fn kernel_written_in(first: usize, last: usize, found: &mut Vec<WatchAddress>) -> WatchAnswer {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    if found.len() < count {
-        found.resize(count, 0);
-    }
+    // GetWriteWatch only writes the addresses it returns. Do not touch
+    // every cache line of the worst-case output buffer before asking.
+    debug_assert!(found.is_empty(), "write-watch scratch uses only spare capacity");
+    found.reserve(count);
+    let addresses = &mut found.spare_capacity_mut()[..count];
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -414,7 +417,7 @@ fn kernel_written_in(first: usize, last: usize, found: &mut Vec<usize>) -> Watch
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
             (last - first) * PAGE,
-            found.as_mut_ptr().cast(),
+            addresses.as_mut_ptr().cast(),
             &mut count,
             &mut granularity,
         )
@@ -438,7 +441,9 @@ fn kernel_written_in(first: usize, last: usize, found: &mut Vec<usize>) -> Watch
         tally(1, ((last - first) * (PAGE >> 10)) as u64);
     }
     let mut pages: Vec<(usize, u16)> = Vec::new();
-    for &at in &found[..count] {
+    for &at in &addresses[..count] {
+        // SAFETY: on success GetWriteWatch initialized the returned prefix.
+        let at = unsafe { at.assume_init() }.addr();
         let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
         match pages.last_mut() {
             Some((last, parts)) if *last == page => *parts |= part,
