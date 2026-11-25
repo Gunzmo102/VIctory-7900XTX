@@ -237,65 +237,117 @@ impl Drop for Asking {
     }
 }
 
-thread_local! {
-    /// Room for the kernel's answer.
-    static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+type WatchAnswer = Option<Vec<(usize, u16)>>;
+
+struct WatchRequest {
+    first: usize,
+    last: usize,
+    reply: std::sync::mpsc::SyncSender<WatchAnswer>,
+}
+
+/// One worker handles write-watch queries for UMA refreshes. Its answer
+/// buffer is shared by all callers instead of being retained per refresh
+/// thread. Callers still hold `Asking` until they journal the answer, and
+/// wait for it before using the corresponding GPU copy. The rendezvous
+/// channel keeps requests from building an unbounded queue.
+/// `VICTORY_UMA_WATCH_THREAD=0` runs queries on the caller instead.
+fn watch_worker() -> Option<&'static std::sync::mpsc::SyncSender<WatchRequest>> {
+    static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<WatchRequest>>> =
+        std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        if std::env::var_os("VICTORY_UMA_WATCH_THREAD").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WatchRequest>(0);
+        match std::thread::Builder::new().name("victory-uma-watch".into()).spawn(move || {
+            let mut found = Vec::new();
+            while let Ok(request) = rx.recv() {
+                let answer = kernel_written_in(request.first, request.last, &mut found);
+                let _ = request.reply.send(answer);
+                // A very large one-off query should not leave its scratch
+                // allocation resident for the lifetime of the worker.
+                if found.capacity() > (2 << 20) / std::mem::size_of::<usize>() {
+                    found = Vec::new();
+                }
+            }
+        }) {
+            Ok(_) => Some(tx),
+            Err(error) => {
+                tracing::warn!(%error, "could not start UMA write-watch worker; querying on caller threads");
+                None
+            }
+        }
+    }).as_ref()
 }
 
 /// The pages of `[first, last)` the kernel says were written since it was
 /// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+    if let Some(worker) = watch_worker() {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        if worker.send(WatchRequest { first, last, reply }).is_ok() {
+            // A lost reply might have reset write-watch bits already. Do not
+            // retry and silently treat those pages as clean.
+            return answer
+                .recv()
+                .expect("UMA write-watch worker stopped during a query");
+        }
+    }
+    thread_local! {
+        static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    FOUND.with(|found| kernel_written_in(first, last, &mut found.borrow_mut()))
+}
+
+fn kernel_written_in(first: usize, last: usize, found: &mut Vec<usize>) -> WatchAnswer {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    FOUND.with(|found| {
-        let mut found = found.borrow_mut();
-        let mut count = (last - first) * PAGE / KERNEL_PAGE;
-        if found.len() < count {
-            found.resize(count, 0);
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    if found.len() < count {
+        found.resize(count, 0);
+    }
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(10, u64::from(failed));
+        tally(11, started.elapsed().as_nanos() as u64);
+    }
+    if failed {
+        return None;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(12, count as u64);
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+        slow(started.elapsed().as_micros() as u64);
+        tally(0, 1);
+        tally(1, ((last - first) * (PAGE >> 10)) as u64);
+    }
+    let mut pages: Vec<(usize, u16)> = Vec::new();
+    for &at in &found[..count] {
+        let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
+        match pages.last_mut() {
+            Some((last, parts)) if *last == page => *parts |= part,
+            _ => pages.push((page, part)),
         }
-        let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        // SAFETY: the answer buffer holds `count` entries.
-        let failed = unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
-        #[cfg(feature = "diagnostics")]
-        {
-            tally(10, u64::from(failed));
-            tally(11, started.elapsed().as_nanos() as u64);
-        }
-        if failed {
-            return None;
-        }
-        #[cfg(feature = "diagnostics")]
-        {
-            tally(12, count as u64);
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::WatchUs, started.elapsed().as_micros() as u64);
-            slow(started.elapsed().as_micros() as u64);
-            tally(0, 1);
-            tally(1, ((last - first) * (PAGE >> 10)) as u64);
-        }
-        let mut pages: Vec<(usize, u16)> = Vec::new();
-        for &at in &found[..count] {
-            let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
-            match pages.last_mut() {
-                Some((last, parts)) if *last == page => *parts |= part,
-                _ => pages.push((page, part)),
-            }
-        }
-        Some(pages)
-    })
+    }
+    Some(pages)
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -2702,6 +2754,42 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn concurrent_uma_queries_return_and_reset_each_written_part() {
+        // SAFETY: our write-watched allocation remains live until the workers join.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        assert_eq!(kernel_written(p / PAGE, p / PAGE + 4), Some(Vec::new()));
+        // SAFETY: the two addresses are within our allocation.
+        unsafe {
+            ((p + KERNEL_PAGE) as *mut u8).write_volatile(1);
+            ((p + 2 * PAGE + 2 * KERNEL_PAGE) as *mut u8).write_volatile(1);
+        }
+        std::thread::scope(|scope| {
+            let asks: Vec<_> = (0..4)
+                .map(|i| scope.spawn(move || kernel_written(p / PAGE + i, p / PAGE + i + 1)))
+                .collect();
+            for (i, ask) in asks.into_iter().enumerate() {
+                let expected = match i {
+                    0 => vec![(p / PAGE, 1 << 1)],
+                    2 => vec![(p / PAGE + 2, 1 << 2)],
+                    _ => Vec::new(),
+                };
+                assert_eq!(ask.join().unwrap(), Some(expected));
+            }
+        });
+        assert_eq!(kernel_written(p / PAGE, p / PAGE + 4), Some(Vec::new()));
+        // SAFETY: all queries have completed.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

@@ -434,6 +434,9 @@ fn sweep() {
     crate::book::check();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
+    let idle = ram_idle_ms(available_physical_ram());
+    trim_card_lists(now, idle);
+    send::trim_idle(now, idle);
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
@@ -1939,14 +1942,9 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
-    /// Before a submission's lists: what changed on the copies' CPU side
-    /// goes to their card side. Those not in use: a plan takes one and
-    /// gives it back when its submission has run (`Host::card_done`), so
-    /// that submissions sent ahead ([`late`]) each have their own.
-    sync: Vec<Prelude>,
-    /// After them, in the same submission: the compare of the declared
-    /// ranges with their bytes from before. As `sync`.
-    check: Vec<Prelude>,
+    /// Completed DIRECT lists and allocators, shared by uploads and compares.
+    /// A plan borrows them until its submission finishes.
+    spare: Vec<(u64, Prelude)>,
     /// After it ran: the pieces that differ come down.
     fetch: Prelude,
     root: ID3D12RootSignature,
@@ -1968,6 +1966,20 @@ struct CardWork {
 unsafe impl Send for CardWork {}
 
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
+
+/// Drops completed command streams that have not been reused recently.
+fn trim_card_lists(now: u64, idle: u64) {
+    let expired = {
+        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(work) = work.as_mut() else { return };
+        // Returned in timestamp order, oldest first. Reuse takes the newest.
+        let n = work.spare.partition_point(|(since, _)| now.saturating_sub(*since) >= idle);
+        work.spare.drain(..n).collect::<Vec<_>>()
+    };
+    // Release driver objects without holding the pool lock.
+    drop(expired);
+}
+
 
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one group per 64 KiB piece (cut at multiples of
@@ -2161,9 +2173,8 @@ struct CardPlan {
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
-    /// The lists of ours the plan recorded (whether the compare, the
-    /// list), given back by `Host::card_done`.
-    lists: Vec<(bool, Prelude)>,
+    /// The lists this plan recorded, given back by `Host::card_done`.
+    lists: Vec<Prelude>,
     /// With [`relay`]: the number of the send to copies in the card's memory
     /// that the submission ran behind ([`QUEUE_ORDER`]).
     sent_as: u64,
@@ -4163,8 +4174,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             name(&pso, || crate::replay::play::COMPARE.into());
             Ok(CardWork {
-                sync: vec![list()?],
-                check: vec![list()?],
+                spare: Vec::new(),
                 fetch: list()?,
                 root,
                 pso,
@@ -4232,14 +4242,14 @@ impl Host {
                 }
             }
         }
-        let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut used: Vec<Prelude> = Vec::new();
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
         if !dirty.is_empty() {
-            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
+            let Some(sync) = work.spare.pop().map(|(_, list)| list).or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let _recording = crate::timeline::span("copies in the card's memory: the list");
@@ -4332,7 +4342,7 @@ impl Host {
             if let Err(e) = recorded {
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
             }
-            used.push((false, sync));
+            used.push(sync);
         }
         drop(order);
         let mut plan = CardPlan {
@@ -4395,7 +4405,7 @@ impl Host {
         }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
-            let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
+            let Some(check) = work.spare.pop().map(|(_, list)| list).or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
             let (allocator, list) = &check;
@@ -4438,7 +4448,7 @@ impl Host {
                 Ok(list) => plan.check = Some(list),
                 Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
             }
-            plan.lists.push((true, check));
+            plan.lists.push(check);
         }
         work.out += 1;
         Some(plan)
@@ -4470,9 +4480,8 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
-        for (check, list) in plan.lists {
-            if check { work.check.push(list) } else { work.sync.push(list) }
-        }
+        let now = now_ms();
+        work.spare.extend(plan.lists.into_iter().map(|list| (now, list)));
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
         // not read yet: the area starts again only when none is out.

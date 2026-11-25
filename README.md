@@ -36,7 +36,49 @@ What is known to be wrong:
   pipelines (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:3e0a3bcae743d348b8237ed7d7c30740b51006bdf466c8323a13af03336f1830 -->
+
 ## How to run it
+
+### Linux via Proton
+
+On x86-64 Linux, install rustup and the x86-64 MinGW GCC and binutils
+(`gcc-mingw-w64-x86-64` and `binutils-mingw-w64-x86-64` on Ubuntu). Build the
+Windows executable directly on Linux:
+
+```bash
+./scripts/build-linux.sh
+```
+
+The script builds the diagnostics profile at
+`target/x86_64-pc-windows-gnu/diag/victory.exe`. It also accepts `release` or
+`dev`; set `VICTORY_BUILD_PROFILE` to the same value when launching.
+
+Install Proton through Steam, then point the launcher at that installation
+and your own title executable:
+
+```bash
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam"
+export PROTON="$STEAM_COMPAT_CLIENT_INSTALL_PATH/steamapps/common/Proton - Experimental/proton"
+./scripts/play-proton.sh "/path/to/your/title.exe"
+```
+
+Adjust both paths to match your Steam and Proton library. The launcher uses
+a separate prefix under `${XDG_DATA_HOME:-$HOME/.local/share}/victory/compatdata`
+by default. Set `STEAM_COMPAT_DATA_PATH` to use a different prefix. If you use
+`victory.toml`, configure paths as Windows paths visible in the prefix (for
+example, `Z:\home\you\games` with Proton's default Z: mapping).
+
+UMA write-watch queries use a dedicated worker by default. It reuses one
+scratch buffer and releases oversized buffers after a query. To compare
+against the previous caller-thread behavior, launch with
+`VICTORY_UMA_WATCH_THREAD=0`.
+
+### Windows
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build

@@ -211,8 +211,8 @@ impl Worker {
 
     fn work(self) {
         let mut value = 0;
+        let mut jobs = Vec::with_capacity(BATCH.1);
         loop {
-            let mut jobs = Vec::new();
             {
                 let mut queue = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
                 while queue.is_empty() {
@@ -228,9 +228,10 @@ impl Worker {
             }
             value += 1;
             if let Err(e) = self.copy(&jobs, value) {
-                tracing::warn!(error = %e, "uploads ahead did not run");
+                crate::host::fail(format_args!("texture uploads ahead did not complete ({e})"));
             }
-            finish(jobs);
+            finish(&jobs);
+            jobs.clear();
         }
     }
 
@@ -251,6 +252,12 @@ impl Worker {
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)
             self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            // Device removal also wakes fence waiters, with this sentinel.
+            if self.fence.GetCompletedValue() == u64::MAX {
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+                ));
+            }
         }
         Ok(())
     }
@@ -283,8 +290,8 @@ impl Job {
 }
 
 /// The jobs' copies have run.
-fn finish(jobs: Vec<Arc<Job>>) {
-    for job in &jobs {
+fn finish(jobs: &[Arc<Job>]) {
+    for job in jobs {
         job.staging.uploaded.store(true, Relaxed);
         job.staging.dirty.store(false, Relaxed);
         job.staging.note_held();
@@ -296,7 +303,7 @@ fn finish(jobs: Vec<Arc<Job>>) {
         way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
         LANDED.notify_all();
     }
-    for job in &jobs {
+    for job in jobs {
         let us = job.asked.elapsed().as_micros() as u64;
         let n = STATS[0].fetch_add(1, Relaxed) + 1;
         let bytes = STATS[1].fetch_add(job.staging.read as u64, Relaxed) + job.staging.read as u64;

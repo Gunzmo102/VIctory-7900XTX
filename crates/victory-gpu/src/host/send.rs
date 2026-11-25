@@ -116,7 +116,7 @@ pub(super) struct Memory {
 unsafe impl Send for Memory {}
 
 /// What submissions that have run gave back.
-static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
+static SPARE: Mutex<Vec<(u64, Memory)>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
@@ -138,9 +138,9 @@ fn on_card() -> bool {
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
+        let fit = spare.iter().enumerate().filter(|(_, (_, m))| m.size >= size).min_by_key(|(_, (since, m))| (m.size, std::cmp::Reverse(*since))).map(|(i, _)| i);
         if let Some(i) = fit {
-            return Some(spare.swap_remove(i));
+            return Some(spare.swap_remove(i).1);
         }
     }
     // By doubles, so that the next of about this size finds it: what
@@ -161,12 +161,29 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
 
 /// The submission has run.
 pub(super) fn give_back(memory: Memory) {
-    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-    spare.push(memory);
-    spare.sort_by_key(|m| std::cmp::Reverse(m.size));
-    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
-        spare.remove(0);
-    }
+    let evicted = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.push((now_ms(), memory));
+        // Keep the smaller buffers when over budget, and evict the oldest
+        // first among equally sized buffers.
+        spare.sort_unstable_by_key(|(since, m)| (m.size, std::cmp::Reverse(*since)));
+        let mut bytes = 0u64;
+        let n = spare.iter().take_while(|(_, m)| {
+            bytes += m.size;
+            bytes <= kept()
+        }).count();
+        spare.split_off(n)
+    };
+    drop(evicted);
+}
+
+/// Releases unused send buffers after the RAM pressure-adjusted idle period.
+pub(super) fn trim_idle(now: u64, idle: u64) {
+    let expired = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.extract_if(.., |(since, _)| now.saturating_sub(*since) >= idle).collect::<Vec<_>>()
+    };
+    drop(expired);
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
