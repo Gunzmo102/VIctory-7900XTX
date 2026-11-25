@@ -65,7 +65,27 @@ in that order of size:
   normalized buffer codes were one step off.
 - **Every ray missed**: the dispatch flag that says counts are threads, not groups.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:3bca7ade9104cb88b6921a99b2b9d42b07f0e1dc2f5c1cfa523b644c58aaf7f4 -->
+
+## Checking upload bandwidth
+
+Small buffer updates normally pack every four consecutive changed words
+with one destination offset. This sends 20 bytes for those four words,
+compared with 32 bytes when each word carries its own offset. It never
+uploads the gaps between changed words.
+
+For a same-scene comparison, run with `VICTORY_SEND_PACKED=0` and with the
+default, keeping `VICTORY_SEND_OWN` and the other options the same. Compare
+the frame log's scatter bytes and preparation time, plus frame time. The
+packet-byte count excludes bus overhead; it is not a PCIe counter. The heap
+sync line also reports how many bytes the CPU reads while finding changed
+descriptors.
+
 ## Measured and not worth it
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 - Unordered early pipelines for everything (AMD's compiler crashed).
 - Series S profile, smaller textures, a second drawing queue, `ASYNC_SUBMIT` off.

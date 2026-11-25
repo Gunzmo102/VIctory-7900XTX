@@ -7,7 +7,7 @@ use victory_formats::texture::{Dimension, Layout, Swizzle};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::Staging;
-use crate::host::{Host, compile, transition};
+use crate::host::{Host, compile, raw_compute_root, transition};
 
 pub(super) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -44,7 +44,7 @@ pub(super) fn pass(host: &Host) -> Option<&'static Pass> {
             windows::core::s!("cs_5_1"),
         )
         .ok()?;
-        let root = root_signature(host)?;
+        let root = raw_compute_root(host, 8)?;
         // SAFETY: the shader bytecode and root signature outlive creation.
         unsafe {
             let pipeline = host
@@ -62,51 +62,6 @@ pub(super) fn pass(host: &Host) -> Option<&'static Pass> {
         }
     })
     .as_ref()
-}
-
-// Serialize explicitly so the shader does not depend on its compiler
-// supporting embedded root signatures (some Wine compilers ignore them).
-fn root_signature(host: &Host) -> Option<ID3D12RootSignature> {
-    let binding = |kind| D3D12_ROOT_PARAMETER {
-        ParameterType: kind,
-        Anonymous: D3D12_ROOT_PARAMETER_0 {
-            Descriptor: D3D12_ROOT_DESCRIPTOR {
-                ShaderRegister: 0,
-                RegisterSpace: 0,
-            },
-        },
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-    };
-    let params = [
-        D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Constants: D3D12_ROOT_CONSTANTS {
-                    ShaderRegister: 0,
-                    RegisterSpace: 0,
-                    Num32BitValues: 8,
-                },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        },
-        binding(D3D12_ROOT_PARAMETER_TYPE_SRV),
-        binding(D3D12_ROOT_PARAMETER_TYPE_UAV),
-    ];
-    let desc = D3D12_ROOT_SIGNATURE_DESC {
-        NumParameters: params.len() as u32,
-        pParameters: params.as_ptr(),
-        ..Default::default()
-    };
-    let mut blob = None;
-    // SAFETY: the descriptors outlive serialization and the returned blob
-    // owns the bytes read by CreateRootSignature.
-    unsafe {
-        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).ok()?;
-        let blob = blob?;
-        let bytes =
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        host.device.CreateRootSignature(0, bytes).ok()
-    }
 }
 
 /// Bound each worker's additional upload and device memory, and leave

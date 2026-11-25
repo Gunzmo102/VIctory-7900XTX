@@ -1385,6 +1385,51 @@ pub(crate) fn compile(
     Ok(bytes.to_vec())
 }
 
+// Serialize explicitly so the shader does not depend on its compiler
+// supporting embedded root signatures (some Wine compilers ignore them).
+pub(crate) fn raw_compute_root(host: &Host, words: u32) -> Option<ID3D12RootSignature> {
+    let binding = |kind| D3D12_ROOT_PARAMETER {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: words,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        binding(D3D12_ROOT_PARAMETER_TYPE_SRV),
+        binding(D3D12_ROOT_PARAMETER_TYPE_UAV),
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        ..Default::default()
+    };
+    let mut blob = None;
+    // SAFETY: the descriptors outlive serialization and the returned blob
+    // owns the bytes read by CreateRootSignature.
+    unsafe {
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).ok()?;
+        let blob = blob?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        host.device.CreateRootSignature(0, bytes).ok()
+    }
+}
+
 impl PlanePass {
     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
     /// or of floats and the depth format `format`.
@@ -3590,11 +3635,13 @@ fn late_line(frames: f64) {
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
-                "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
-                 taking them out of the CPU sides",
+                "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters \
+                 ({:.2} MB encoded, {:.2} MB saved by packing); {:.2} ms taking them out of the CPU sides",
                 t[0] / (1 << 20) as f64,
                 t[1],
                 t[2],
+                t[4] / (1 << 20) as f64,
+                (t[2] * 8.0 - t[4]).max(0.0) / (1 << 20) as f64,
                 t[3] / 1000.0,
             );
         }
