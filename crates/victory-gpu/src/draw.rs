@@ -1371,6 +1371,11 @@ impl State {
                 SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
                 StrideInBytes: v.stride,
             };
+            #[cfg(feature = "diagnostics")]
+            crate::shadow::duplicates::mesh(
+                v.address, view.SizeInBytes,
+                crate::shadow::duplicates::Kind::Vertex(v.stride),
+            );
         }
         // SAFETY: an open list; the views name live host buffers.
         unsafe {
@@ -1389,6 +1394,10 @@ impl State {
                 SizeInBytes: v.size.min(u32::try_from(shadow.left(v.address)).unwrap_or(u32::MAX)),
                 Format: DXGI_FORMAT(v.format as i32),
             };
+            #[cfg(feature = "diagnostics")]
+            crate::shadow::duplicates::mesh(
+                v.address, view.SizeInBytes, crate::shadow::duplicates::Kind::Index(v.format),
+            );
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
