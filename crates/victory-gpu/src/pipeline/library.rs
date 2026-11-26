@@ -512,6 +512,49 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Trace the calls that can enter the driver. Wine's Vulkan error includes
+/// the Windows thread ID in hex, so it can be matched to an unfinished call.
+fn driver_call<T>(
+    operation: &'static str,
+    name: &str,
+    run: impl FnOnce() -> windows::core::Result<T>,
+) -> windows::core::Result<T> {
+    #[cfg(feature = "diagnostics")]
+    let tracing = {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_TRACE").is_some_and(|v| v == "1"))
+    };
+    #[cfg(feature = "diagnostics")]
+    if tracing {
+        let thread = crate::host::thread_id();
+        LABEL.with(|label| {
+            let shaders = label.borrow();
+            tracing::info!(
+                thread = format_args!("{thread:04x}"),
+                operation,
+                pipeline = name,
+                shaders = shaders.as_str(),
+                "pipeline driver call starting"
+            );
+        });
+    }
+    let result = run();
+    #[cfg(feature = "diagnostics")]
+    if tracing {
+        let thread = crate::host::thread_id();
+        tracing::info!(
+            thread = format_args!("{thread:04x}"),
+            operation,
+            pipeline = name,
+            ok = result.is_ok(),
+            "pipeline driver call returned"
+        );
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (operation, name);
+    result
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -522,14 +565,14 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return driver_call("create", name, create);
     };
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
-        load(&library.library, PCWSTR(wide.as_ptr()))
+        driver_call("load", name, || load(&library.library, PCWSTR(wide.as_ptr())))
     };
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
@@ -548,7 +591,7 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        driver_call("create", name, create)?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -563,7 +606,11 @@ pub(crate) fn pipeline(
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if driver_call("store", name, || unsafe {
+        library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso)
+    })
+    .is_ok()
+    {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
