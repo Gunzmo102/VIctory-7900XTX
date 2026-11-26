@@ -147,7 +147,30 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                // Translation can exhaust a worker's stack before the driver
+                // call is reached. Log its thread and hash before starting.
+                #[cfg(feature = "diagnostics")]
+                if library::trace_enabled() {
+                    let thread = crate::host::thread_id();
+                    tracing::info!(
+                        thread = format_args!("{thread:04x}"),
+                        stage = self.stage,
+                        hash = %self.hash,
+                        "shader preparation starting"
+                    );
+                }
                 let done = translate(&self.container);
+                #[cfg(feature = "diagnostics")]
+                if library::trace_enabled() {
+                    let thread = crate::host::thread_id();
+                    tracing::info!(
+                        thread = format_args!("{thread:04x}"),
+                        stage = self.stage,
+                        hash = %self.hash,
+                        ok = done.is_ok(),
+                        "shader preparation returned"
+                    );
+                }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {

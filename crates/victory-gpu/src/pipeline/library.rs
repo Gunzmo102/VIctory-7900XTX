@@ -512,6 +512,13 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Whether to log work before potentially failing pipeline operations.
+#[cfg(feature = "diagnostics")]
+pub(super) fn trace_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_TRACE").is_some_and(|v| v == "1"))
+}
+
 /// Trace the calls that can enter the driver. Wine's Vulkan error includes
 /// the Windows thread ID in hex, so it can be matched to an unfinished call.
 fn driver_call<T>(
@@ -520,10 +527,7 @@ fn driver_call<T>(
     run: impl FnOnce() -> windows::core::Result<T>,
 ) -> windows::core::Result<T> {
     #[cfg(feature = "diagnostics")]
-    let tracing = {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_TRACE").is_some_and(|v| v == "1"))
-    };
+    let tracing = trace_enabled();
     #[cfg(feature = "diagnostics")]
     if tracing {
         let thread = crate::host::thread_id();
