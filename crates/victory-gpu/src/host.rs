@@ -1899,39 +1899,43 @@ fn scratch_pool() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_POOL").is_none_or(|v| v != "0"))
 }
 
-/// Things of some sizes that nothing holds now, kept for whoever next asks
-/// for one of the same size.
+/// Free scratch chunks, kept in separate stacks by size. Taking the last
+/// chunk leaves the bin's capacity available for the next release.
 struct Spare<T> {
-    kept: Vec<(T, u64)>,
+    sizes: [u64; 2],
+    kept: [Vec<T>; 2],
     bytes: u64,
 }
 
 impl<T> Spare<T> {
-    const fn new() -> Self {
-        Spare { kept: Vec::new(), bytes: 0 }
+    const fn new(sizes: [u64; 2]) -> Self {
+        Spare { sizes, kept: [const { Vec::new() }; 2], bytes: 0 }
     }
 
     /// A kept thing of `size` bytes, the one given last.
     fn take(&mut self, size: u64) -> Option<T> {
-        let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
+        let class = self.sizes.iter().position(|&known| known == size)?;
+        let last = self.kept[class].pop()?;
         self.bytes -= size;
-        Some(self.kept.remove(at).0)
+        Some(last)
     }
 
-    /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
-    /// `most`: then it comes back.
+    /// Returns the item if its size has no bin or would exceed the budget.
     fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
-        if self.bytes + size > most {
+        let Some(class) = self.sizes.iter().position(|&known| known == size) else {
+            return Some(thing);
+        };
+        if size > most.saturating_sub(self.bytes) {
             return Some(thing);
         }
         self.bytes += size;
-        self.kept.push((thing, size));
+        self.kept[class].push(thing);
         None
     }
 }
 
 /// Scratch chunks no list holds.
-static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new([SCRATCH_FIRST, SCRATCH_CHUNK]));
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
@@ -9629,7 +9633,7 @@ mod spare {
     /// kept past the limit.
     #[test]
     fn kept_things_come_back_by_size_within_the_limit() {
-        let mut spare: Spare<u32> = Spare::new();
+        let mut spare: Spare<u32> = Spare::new([1, 4]);
         assert_eq!(spare.take(4), None);
         assert_eq!(spare.give(1, 4, 10), None);
         assert_eq!(spare.give(2, 1, 10), None);
@@ -9638,13 +9642,14 @@ mod spare {
         // Past the limit: handed back, nothing changes.
         assert_eq!(spare.give(4, 4, 10), Some(4));
         assert_eq!(spare.bytes, 9);
+        assert_eq!(spare.give(5, 2, 10), Some(5), "no bin of that size");
         assert_eq!(spare.take(2), None, "no thing of that size");
         assert_eq!(spare.take(4), Some(3));
         assert_eq!(spare.take(4), Some(1));
         assert_eq!(spare.take(4), None);
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
-        assert!(spare.kept.is_empty());
+        assert!(spare.kept.iter().all(Vec::is_empty));
     }
 }
 
