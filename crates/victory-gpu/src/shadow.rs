@@ -24,6 +24,9 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+#[cfg(feature = "diagnostics")]
+pub(crate) mod duplicates;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -2482,6 +2485,8 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        duplicates::dropped(self.id);
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2930,11 +2935,9 @@ impl Shadow {
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
-        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
         // Not a copy: not counted with them, and nothing asks what the
         // title wrote there.
-        LIVE[0].fetch_sub(1, Ordering::Relaxed);
-        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        let mut shadow = Shadow::new_inner(placed.buffer, start as *mut u8, placed.gpu, start, len, false);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
@@ -2955,9 +2958,19 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        Self::new_inner(buffer, data, gpu, start, len, true)
+    }
+
+    fn new_inner(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, copied: bool) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
-        LIVE[0].fetch_add(1, Ordering::Relaxed);
-        LIVE[1].fetch_add(len, Ordering::Relaxed);
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        if copied {
+            LIVE[0].fetch_add(1, Ordering::Relaxed);
+            LIVE[1].fetch_add(len, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            duplicates::made(id, start, len);
+        }
         Shadow {
             landings: Mutex::default(),
             landing: Default::default(),
@@ -2979,10 +2992,7 @@ impl Shadow {
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
-            id: {
-                static NEXT: AtomicU64 = AtomicU64::new(1);
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            },
+            id,
             card: None,
             window: false,
             changes_only: Default::default(),
@@ -4886,6 +4896,64 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans
 }
 
+/// Other live resources with exactly the same bytes can use the same host
+/// copy. Partial overlaps are deliberately excluded: the selected resource
+/// still determines the visible buffer bounds.
+fn exact_alias<T, C>(
+    map: &BTreeMap<(u64, usize), T>, key: (u64, usize), end: u64,
+    copy: impl Fn(&T, u64) -> Option<C>,
+) -> Option<C> {
+    map.range((key.0, 0)..=(key.0, usize::MAX))
+        .filter(|(other, _)| **other != key)
+        .find_map(|(_, entry)| copy(entry, end))
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn reuse_requires_another_live_buffer_with_the_exact_span() {
+        let copy = Arc::new(17);
+        let mut map = BTreeMap::from([
+            ((0x1000, 1), (0x1800, Some(copy.clone()))),
+            ((0x1000, 2), (0x1800, None)),
+            ((0x1000, 3), (0x1600, Some(Arc::new(23)))),
+            ((0x1100, 4), (0x1800, Some(Arc::new(24)))),
+        ]);
+        let get = |(end, copy): &(u64, Option<Arc<i32>>), want| {
+            if *end == want { copy.clone() } else { None }
+        };
+        let alias = exact_alias(&map, (0x1000, 2), 0x1800, get).unwrap();
+        assert!(Arc::ptr_eq(&copy, &alias));
+        assert!(exact_alias(&map, (0x1000, 1), 0x1800, get).is_none());
+        map.remove(&(0x1000, 1));
+        assert!(exact_alias(&map, (0x1000, 2), 0x1800, get).is_none());
+        assert_eq!(*alias, 17);
+    }
+
+    #[test]
+    fn registered_aliases_share_one_host_buffer_until_the_last_unregister() {
+        if host().is_none() {
+            eprintln!("no D3D12 adapter; skipped shadow allocation");
+            return;
+        }
+        let title = vec![0u8; 4096];
+        let (start, len) = (title.as_ptr() as u64, title.len() as u64);
+        register(1, start, len);
+        let first = find(start, len).unwrap();
+        assert!(!first.in_place(), "test requires the copied UMA path");
+        register(2, start, len);
+        let alias = find(start, len).unwrap();
+        assert!(Arc::ptr_eq(&first, &alias));
+        unregister(1, start);
+        assert!(Arc::ptr_eq(&alias, &peek(start, len).unwrap()));
+        unregister(2, start);
+        assert!(peek(start, len).is_none());
+    }
+
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
@@ -4959,6 +5027,25 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
+    let entry = map.get(&key)?;
+    if entry.shadow.is_none() {
+        // The buffer table's write lock serializes alias reuse and creation.
+        // Don't revive copies held only by old lists after unregister.
+        if let Some(shadow) = exact_alias(&map, key, entry.end, |entry, end| {
+            if entry.end == end {
+                // In-place views already share the physical bytes. Leave
+                // their heap and mapping lifetimes with the original owner.
+                entry.shadow.as_ref().filter(|shadow| !shadow.in_place()).cloned()
+            } else {
+                None
+            }
+        }) {
+            map.get_mut(&key)?.shadow = Some(shadow.clone());
+            #[cfg(feature = "diagnostics")]
+            duplicates::alias_reused(shadow.len);
+            return Some(shadow);
+        }
+    }
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;

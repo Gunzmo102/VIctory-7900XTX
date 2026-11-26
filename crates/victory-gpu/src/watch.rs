@@ -54,30 +54,128 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
+type PageMap<T> = std::collections::HashMap<usize, T, std::hash::BuildHasherDefault<PageHash>>;
+
+/// Sixteen write numbers with their common high bits stored once. Keep the
+/// full numbers separately for pages that straddle a 32-bit epoch boundary.
+struct PackedParts {
+    high: u32,
+    low: [u32; PARTS],
+}
+
+impl PackedParts {
+    fn number(high: u32, low: u32) -> u64 {
+        (u64::from(high) << 32) | u64::from(low)
+    }
+
+    fn pack(all: &[u64; PARTS], high: u32) -> Option<Self> {
+        all.iter().all(|&at| (at >> 32) as u32 == high)
+            .then(|| Self { high, low: all.map(|at| at as u32) })
+    }
+
+    fn unpack(&self) -> [u64; PARTS] {
+        self.low.map(|low| Self::number(self.high, low))
+    }
+
+    fn since(&self, taken: u64) -> u16 {
+        use std::cmp::Ordering;
+        match self.high.cmp(&((taken >> 32) as u32)) {
+            Ordering::Less => 0,
+            Ordering::Greater => WHOLE,
+            Ordering::Equal => mask_since(&self.low, taken as u32),
+        }
+    }
+}
+
+fn mask_since<T: Ord>(all: &[T; PARTS], taken: T) -> u16 {
+    all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k)
+}
+
+fn set_parts<T: Copy>(all: &mut [T; PARTS], mut mask: u16, now: T) {
+    while mask != 0 {
+        all[mask.trailing_zeros() as usize] = now;
+        mask &= mask - 1;
+    }
+}
+
+struct PartHistory {
+    packed: PageMap<PackedParts>,
+    wide: PageMap<[u64; PARTS]>,
+}
+
+impl PartHistory {
+    const fn new() -> Self {
+        Self {
+            packed: PageMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            wide: PageMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        }
+    }
+
+    fn forget(&mut self, page: usize) {
+        if self.packed.remove(&page).is_none() {
+            self.remove_wide(page);
+        }
+    }
+
+    fn remove_wide(&mut self, page: usize) {
+        // Release the wide allocation when its last entry goes away.
+        if self.wide.remove(&page).is_some() && self.wide.is_empty() {
+            self.wide = PageMap::with_hasher(std::hash::BuildHasherDefault::new());
+        }
+    }
+
+    fn note(&mut self, page: usize, mask: u16, before: u64, now: u64) {
+        let high = (now >> 32) as u32;
+        if let Some(packed) = self.packed.get_mut(&page)
+            && packed.high == high
+        {
+            set_parts(&mut packed.low, mask, now as u32);
+            return;
+        }
+        if let Some(wide) = self.wide.get_mut(&page) {
+            set_parts(wide, mask, now);
+            if let Some(packed) = PackedParts::pack(wide, high) {
+                self.remove_wide(page);
+                self.packed.insert(page, packed);
+            }
+            return;
+        }
+        let mut all = self.packed.remove(&page).map_or([before; PARTS], |packed| packed.unpack());
+        set_parts(&mut all, mask, now);
+        if let Some(packed) = PackedParts::pack(&all, high) {
+            self.packed.insert(page, packed);
+        } else {
+            self.wide.insert(page, all);
+        }
+    }
+
+    fn since(&self, page: usize, taken: u64) -> u16 {
+        if let Some(packed) = self.packed.get(&page) {
+            packed.since(taken)
+        } else if let Some(wide) = self.wide.get(&page) {
+            mask_since(wide, taken)
+        } else {
+            WHOLE
+        }
+    }
+}
+
 impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.insert(page, now).unwrap_or(0);
         if parts == WHOLE || !parts_on() {
-            self.parts.remove(&page);
-            return before;
-        }
-        let all = self.parts.entry(page).or_insert([before; PARTS]);
-        for (k, at) in all.iter_mut().enumerate() {
-            if parts >> k & 1 != 0 {
-                *at = now;
-            }
+            self.parts.forget(page);
+        } else {
+            self.parts.note(page, parts, before, now);
         }
         before
     }
 
     /// The parts of `page` written by an asking after `taken`.
     fn parts_since(&self, page: usize, taken: u64) -> u16 {
-        match self.parts.get(&page) {
-            Some(all) => all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k),
-            None => WHOLE,
-        }
+        self.parts.since(page, taken)
     }
 }
 
@@ -124,7 +222,7 @@ struct Journal {
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
-    parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+    parts: PartHistory,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
@@ -144,7 +242,7 @@ struct Journal {
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
-    parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    parts: PartHistory::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
@@ -237,65 +335,122 @@ impl Drop for Asking {
     }
 }
 
-thread_local! {
-    /// Room for the kernel's answer.
-    static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+type WatchAnswer = Option<Vec<(usize, u16)>>;
+type WatchAddress = *mut std::ffi::c_void;
+
+struct WatchRequest {
+    first: usize,
+    last: usize,
+    reply: std::sync::mpsc::SyncSender<WatchAnswer>,
+}
+
+/// One worker handles write-watch queries for UMA refreshes. Its answer
+/// buffer is shared by all callers instead of being retained per refresh
+/// thread. Callers still hold `Asking` until they journal the answer, and
+/// wait for it before using the corresponding GPU copy. The rendezvous
+/// channel keeps requests from building an unbounded queue.
+/// `VICTORY_UMA_WATCH_THREAD=0` runs queries on the caller instead.
+fn watch_worker() -> Option<&'static std::sync::mpsc::SyncSender<WatchRequest>> {
+    static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<WatchRequest>>> =
+        std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        if std::env::var_os("VICTORY_UMA_WATCH_THREAD").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WatchRequest>(0);
+        match std::thread::Builder::new().name("victory-uma-watch".into()).spawn(move || {
+            let mut found = Vec::new();
+            while let Ok(request) = rx.recv() {
+                let answer = kernel_written_in(request.first, request.last, &mut found);
+                let _ = request.reply.send(answer);
+                // A very large one-off query should not leave its scratch
+                // allocation resident for the lifetime of the worker.
+                if found.capacity() > (2 << 20) / std::mem::size_of::<WatchAddress>() {
+                    found = Vec::new();
+                }
+            }
+        }) {
+            Ok(_) => Some(tx),
+            Err(error) => {
+                tracing::warn!(%error, "could not start UMA write-watch worker; querying on caller threads");
+                None
+            }
+        }
+    }).as_ref()
 }
 
 /// The pages of `[first, last)` the kernel says were written since it was
 /// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+    if let Some(worker) = watch_worker() {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        if worker.send(WatchRequest { first, last, reply }).is_ok() {
+            // A lost reply might have reset write-watch bits already. Do not
+            // retry and silently treat those pages as clean.
+            return answer
+                .recv()
+                .expect("UMA write-watch worker stopped during a query");
+        }
+    }
+    thread_local! {
+        static FOUND: std::cell::RefCell<Vec<WatchAddress>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    FOUND.with(|found| kernel_written_in(first, last, &mut found.borrow_mut()))
+}
+
+fn kernel_written_in(first: usize, last: usize, found: &mut Vec<WatchAddress>) -> WatchAnswer {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    FOUND.with(|found| {
-        let mut found = found.borrow_mut();
-        let mut count = (last - first) * PAGE / KERNEL_PAGE;
-        if found.len() < count {
-            found.resize(count, 0);
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    // GetWriteWatch only writes the addresses it returns. Do not touch
+    // every cache line of the worst-case output buffer before asking.
+    debug_assert!(found.is_empty(), "write-watch scratch uses only spare capacity");
+    found.reserve(count);
+    let addresses = &mut found.spare_capacity_mut()[..count];
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            addresses.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(10, u64::from(failed));
+        tally(11, started.elapsed().as_nanos() as u64);
+    }
+    if failed {
+        return None;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(12, count as u64);
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+        slow(started.elapsed().as_micros() as u64);
+        tally(0, 1);
+        tally(1, ((last - first) * (PAGE >> 10)) as u64);
+    }
+    let mut pages: Vec<(usize, u16)> = Vec::new();
+    for &at in &addresses[..count] {
+        // SAFETY: on success GetWriteWatch initialized the returned prefix.
+        let at = unsafe { at.assume_init() }.addr();
+        let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
+        match pages.last_mut() {
+            Some((last, parts)) if *last == page => *parts |= part,
+            _ => pages.push((page, part)),
         }
-        let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        // SAFETY: the answer buffer holds `count` entries.
-        let failed = unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
-        #[cfg(feature = "diagnostics")]
-        {
-            tally(10, u64::from(failed));
-            tally(11, started.elapsed().as_nanos() as u64);
-        }
-        if failed {
-            return None;
-        }
-        #[cfg(feature = "diagnostics")]
-        {
-            tally(12, count as u64);
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::WatchUs, started.elapsed().as_micros() as u64);
-            slow(started.elapsed().as_micros() as u64);
-            tally(0, 1);
-            tally(1, ((last - first) * (PAGE >> 10)) as u64);
-        }
-        let mut pages: Vec<(usize, u16)> = Vec::new();
-        for &at in &found[..count] {
-            let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
-            match pages.last_mut() {
-                Some((last, parts)) if *last == page => *parts |= part,
-                _ => pages.push((page, part)),
-            }
-        }
-        Some(pages)
-    })
+    }
+    Some(pages)
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -2668,10 +2823,41 @@ mod parts_tests {
     use super::*;
 
     #[test]
+    fn packing_preserves_masks_across_epoch_boundaries() {
+        assert_eq!(std::mem::size_of::<PackedParts>(), 68);
+        let mut history = PartHistory::new();
+        let edge = 1u64 << 32;
+        history.note(7, 0b11, edge - 4, edge - 2);
+        assert_eq!(history.since(7, edge - 3), 0b11);
+        assert!(history.packed.contains_key(&7));
+
+        history.note(7, 0b1, edge - 2, edge);
+        assert!(history.wide.contains_key(&7));
+        assert_eq!(history.since(7, edge - 3), 0b11);
+        assert_eq!(history.since(7, edge - 2), 0b1);
+        assert_eq!(history.since(7, edge), 0);
+
+        history.note(7, WHOLE ^ 0b1, edge, edge + 1);
+        assert!(history.packed.contains_key(&7));
+        assert_eq!(history.wide.capacity(), 0);
+        assert_eq!(history.since(7, edge - 1), WHOLE);
+        assert_eq!(history.since(7, edge), WHOLE ^ 0b1);
+        assert_eq!(history.since(7, edge << 1), 0);
+
+        // Untouched parts of a new page still have write number zero,
+        // even when the first write is in a later epoch.
+        history.note(8, 0b100, 0, edge + 1);
+        assert_eq!(history.since(8, 0), 0b100);
+        history.forget(8);
+        assert_eq!(history.wide.capacity(), 0);
+        assert_eq!(history.since(8, edge), WHOLE);
+    }
+
+    #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
             written: BTreeMap::new(),
-            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            parts: PartHistory::new(),
             ahead: Vec::new(),
             ahead_asked: 0,
             kept: false,
@@ -2702,6 +2888,42 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn concurrent_uma_queries_return_and_reset_each_written_part() {
+        // SAFETY: our write-watched allocation remains live until the workers join.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        assert_eq!(kernel_written(p / PAGE, p / PAGE + 4), Some(Vec::new()));
+        // SAFETY: the two addresses are within our allocation.
+        unsafe {
+            ((p + KERNEL_PAGE) as *mut u8).write_volatile(1);
+            ((p + 2 * PAGE + 2 * KERNEL_PAGE) as *mut u8).write_volatile(1);
+        }
+        std::thread::scope(|scope| {
+            let asks: Vec<_> = (0..4)
+                .map(|i| scope.spawn(move || kernel_written(p / PAGE + i, p / PAGE + i + 1)))
+                .collect();
+            for (i, ask) in asks.into_iter().enumerate() {
+                let expected = match i {
+                    0 => vec![(p / PAGE, 1 << 1)],
+                    2 => vec![(p / PAGE + 2, 1 << 2)],
+                    _ => Vec::new(),
+                };
+                assert_eq!(ask.join().unwrap(), Some(expected));
+            }
+        });
+        assert_eq!(kernel_written(p / PAGE, p / PAGE + 4), Some(Vec::new()));
+        // SAFETY: all queries have completed.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

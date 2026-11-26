@@ -16,8 +16,9 @@
 //! So each submission's bytes are taken out of the CPU sides into memory of
 //! the submission's own when they are taken from the dirty lists, and the
 //! card copies them from there. Runs of a few words, which a refresh that
-//! sends only what changed makes many of, go as pairs of offset and value,
-//! stored by one dispatch per copy; the others as a copy each.
+//! sends only what changed makes many of, share a dispatch per buffer.
+//! Groups of four words share one destination offset in the upload;
+//! short tails use offset/value pairs. Other runs use buffer copies.
 
 use super::*;
 use crate::shadow::Shadow;
@@ -27,10 +28,10 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
-/// Runs up to this many bytes go as pairs.
+/// Runs up to this many bytes go through the scatter shader.
 const SHORT: usize = 256;
 
-/// Whether a run of `len` bytes at offset `at` of a copy goes as pairs.
+/// Whether a run of `len` bytes at offset `at` of a copy uses scatter.
 fn short(at: usize, len: usize) -> bool {
     len <= SHORT && at % 4 == 0 && len % 4 == 0
 }
@@ -60,17 +61,29 @@ pub(crate) fn words_under() -> bool {
     *ON.get_or_init(|| own() && std::env::var_os("VICTORY_UNDER_WORDS").is_none_or(|v| v != "0"))
 }
 
+const PAIR_BYTES: u64 = 8;
+const QUAD_BYTES: u64 = 20;
+
+fn packed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_PACKED").is_none_or(|v| v != "0"))
+}
+
 const SCATTER: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
-cbuffer Part : register(b0) { uint at; uint count; };
-ByteAddressBuffer pairs : register(t0);
+cbuffer Part : register(b0) { uint pairs; uint pair_count; uint quads; uint first; uint count; };
+ByteAddressBuffer packets : register(t0);
 RWByteAddressBuffer card : register(u0);
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= count) return;
-    uint2 p = pairs.Load2(at + id.x * 8u);
-    card.Store(p.x, p.y);
+    uint i = first + id.x;
+    if (i < pair_count) {
+        uint2 p = packets.Load2(pairs + i * 8u);
+        card.Store(p.x, p.y);
+    } else {
+        uint at = quads + (i - pair_count) * 20u;
+        card.Store4(packets.Load(at), packets.Load4(at + 4u));
+    }
 }
 "#;
 
@@ -83,10 +96,9 @@ fn pass(host: &Host) -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
-        // SAFETY: the code lives through the calls; the root signature is
-        // inside it.
+        let root = raw_compute_root(host, 5)?;
+        // SAFETY: the code and root signature live through creation.
         unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).ok()?;
             let pso: ID3D12PipelineState = host
                 .device
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -116,7 +128,7 @@ pub(super) struct Memory {
 unsafe impl Send for Memory {}
 
 /// What submissions that have run gave back.
-static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
+static SPARE: Mutex<Vec<(u64, Memory)>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
@@ -138,9 +150,9 @@ fn on_card() -> bool {
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
+        let fit = spare.iter().enumerate().filter(|(_, (_, m))| m.size >= size).min_by_key(|(_, (since, m))| (m.size, std::cmp::Reverse(*since))).map(|(i, _)| i);
         if let Some(i) = fit {
-            return Some(spare.swap_remove(i));
+            return Some(spare.swap_remove(i).1);
         }
     }
     // By doubles, so that the next of about this size finds it: what
@@ -161,23 +173,109 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
 
 /// The submission has run.
 pub(super) fn give_back(memory: Memory) {
-    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-    spare.push(memory);
-    spare.sort_by_key(|m| std::cmp::Reverse(m.size));
-    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
-        spare.remove(0);
+    let evicted = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.push((now_ms(), memory));
+        // Keep the smaller buffers when over budget, and evict the oldest
+        // first among equally sized buffers.
+        spare.sort_unstable_by_key(|(since, m)| (m.size, std::cmp::Reverse(*since)));
+        let mut bytes = 0u64;
+        let n = spare.iter().take_while(|(_, m)| {
+            bytes += m.size;
+            bytes <= kept()
+        }).count();
+        spare.split_off(n)
+    };
+    drop(evicted);
+}
+
+/// Releases unused send buffers after the RAM pressure-adjusted idle period.
+pub(super) fn trim_idle(now: u64, idle: u64) {
+    let expired = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.extract_if(.., |(since, _)| now.saturating_sub(*since) >= idle).collect::<Vec<_>>()
+    };
+    drop(expired);
+}
+
+/// Bytes copied, runs copied, words stored, CPU preparation time in
+/// microseconds, and the actual scatter packet bytes.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[derive(Clone, Copy, Default)]
+struct Counts { pairs: u32, quads: u32 }
+
+impl Counts {
+    fn add(&mut self, bytes: usize, packed: bool) {
+        let words = (bytes / 4) as u32;
+        let quads = if packed { words / 4 } else { 0 };
+        self.quads += quads;
+        self.pairs += words - quads * 4;
+    }
+
+    fn packets(self) -> u32 {
+        self.pairs + self.quads
+    }
+
+    fn bytes(self) -> u64 {
+        u64::from(self.pairs) * PAIR_BYTES + u64::from(self.quads) * QUAD_BYTES
     }
 }
 
-/// Since the last frame-rate line: bytes copied, runs copied, words stored,
-/// microseconds of taking them out of the CPU sides.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+#[derive(Clone, Copy)]
+struct Scatter {
+    pairs: u64,
+    quads: u64,
+    counts: Counts,
+}
+
+fn short_counts(ranges: &[(usize, usize)], packed: bool) -> Counts {
+    let mut counts = Counts::default();
+    for &(a, b) in ranges {
+        if short(a, b - a) {
+            counts.add(b - a, packed);
+        }
+    }
+    counts
+}
+
+/// # Safety
+/// Each source run is valid. The pair and quad regions are writable,
+/// aligned to four bytes, disjoint and sized using `short_counts`.
+unsafe fn pack_scatter(
+    src: *const u8, ranges: &[(usize, usize)], packed: bool,
+    mut pairs: *mut [u32; 2], mut quads: *mut [u32; 5],
+) {
+    for &(a, b) in ranges.iter().filter(|&&(a, b)| short(a, b - a)) {
+        let mut offset = a;
+        if packed {
+            while b - offset >= 16 {
+                // SAFETY: this packet stores four consecutive changed
+                // words; none of the neighboring bytes are included.
+                unsafe {
+                    let [a, b, c, d] = src.add(offset).cast::<[u32; 4]>().read_unaligned();
+                    quads.write([offset as u32, a, b, c, d]);
+                    quads = quads.add(1);
+                }
+                offset += 16;
+            }
+        }
+        while offset < b {
+            // SAFETY: one changed word and an output pair assigned to this worker.
+            unsafe {
+                pairs.write([offset as u32, src.add(offset).cast::<u32>().read_unaligned()]);
+                pairs = pairs.add(1);
+            }
+            offset += 4;
+        }
+    }
+}
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
-/// bytes), and its pairs (where in the memory, how many).
+/// bytes), and the packed scatter packets.
 struct Copy {
     runs: Vec<(usize, u64, usize)>,
-    pairs: (u64, u32),
+    scatter: Scatter,
 }
 
 /// Where a submission's bytes are taken to.
@@ -193,61 +291,62 @@ const RUNS_AT_A_TIME: usize = 4096;
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
-    // Runs of whole words of the copy: only those are pairs. (A byte beside
-    // them in a word may be the card's.)
-    let short = |&(a, b): &(usize, usize)| short(a, b - a);
+    // A byte beside a short run's whole words may belong to the GPU.
+    // Pack those runs without widening any destination range.
+    let packed = packed();
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
+        let mut counts = Counts::default();
+        for &(a, b) in ranges {
+            if short(a, b - a) {
+                // HLSL uses 32-bit byte addresses. The regular buffer-copy
+                // fallback still supports the full range.
+                if b as u64 > (1u64 << 32) {
+                    return None;
+                }
+                counts.add(b - a, packed);
+            } else {
+                runs.push((a, at, b - a));
+                at += ((b - a) as u64).next_multiple_of(16);
+            }
         }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-        copies.push(Copy { runs, pairs: (at, words as u32) });
-        at += (words as u64 * 8).next_multiple_of(16);
+        let pairs = at;
+        let quads = pairs + u64::from(counts.pairs) * PAIR_BYTES;
+        at = (quads + u64::from(counts.quads) * QUAD_BYTES).next_multiple_of(16);
+        copies.push(Copy { runs, scatter: Scatter { pairs, quads, counts } });
     }
-    if at == 0 {
+    if at == 0 || at > (1u64 << 32) {
         return None;
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
+    let mut work = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
+        let mut pairs = memory.data + copy.scatter.pairs as usize;
+        let mut quads = memory.data + copy.scatter.quads as usize;
         for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-            if words > 0 {
-                work.push((from, ranges, to));
-                to += words * 8;
+            let counts = short_counts(ranges, packed);
+            if counts.packets() > 0 {
+                work.push((from, ranges, pairs, quads));
+                pairs += counts.pairs as usize * PAIR_BYTES as usize;
+                quads += counts.quads as usize * QUAD_BYTES as usize;
             }
         }
     }
-    let one = |i: usize| {
-        let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| short(r)) {
-            for offset in (a..b).step_by(4) {
-                // SAFETY: inside the copy's mapping (its CPU side, which
-                // the thread that asked, and waits, alone writes in these
-                // ranges) and inside the memory, which has room for every
-                // pair, a piece of work's behind the last one's.
-                unsafe {
-                    let word = ((from + offset) as *const u32).read_unaligned();
-                    to.write([offset as u32, word]);
-                    to = to.add(1);
-                }
-            }
-        }
-    };
-    crate::land::each_under(work.len(), &one);
+    crate::land::each_under(work.len(), &|i| {
+        let (from, ranges, pairs, quads) = work[i];
+        // SAFETY: each job owns its packet region until this call returns;
+        // the live CPU-side copies are stable through packing.
+        unsafe { pack_scatter(from as *const u8, ranges, packed, pairs as *mut _, quads as *mut _) };
+    });
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
-    STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
+    STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.scatter.counts.pairs) + 4 * u64::from(c.scatter.counts.quads)).sum(), Ordering::Relaxed);
+    STATS[4].fetch_add(copies.iter().map(|c| c.scatter.counts.bytes()).sum(), Ordering::Relaxed);
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies })
@@ -277,7 +376,7 @@ impl Own {
                 unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
-            if copy.pairs.1 > 0 {
+            if copy.scatter.counts.packets() > 0 {
                 if let Some(was) = state {
                     first.push(transition(&shadow.buffer, was, write));
                 }
@@ -286,7 +385,7 @@ impl Own {
             let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(was) = state
                 && hashed
-                && (!copy.runs.is_empty() || copy.pairs.1 > 0)
+                && (!copy.runs.is_empty() || copy.scatter.counts.packets() > 0)
             {
                 last.push(transition(&shadow.buffer, was, read));
             }
@@ -297,20 +396,21 @@ impl Own {
                 list.ResourceBarrier(&first);
             }
             if let Some(pass) = pass(host)
-                && self.copies.iter().any(|c| c.pairs.1 > 0)
+                && self.copies.iter().any(|c| c.scatter.counts.packets() > 0)
             {
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
                 list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
-                for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
+                for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.scatter.counts.packets() > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
-                    let (at, words) = copy.pairs;
+                    let scatter = copy.scatter;
+                    let packets = scatter.counts.packets();
                     let mut done = 0;
-                    while done < words {
-                        let n = (words - done).min(MOST);
-                        let constants = [at as u32 + done * 8, n];
-                        list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                    while done < packets {
+                        let n = (packets - done).min(MOST);
+                        let constants = [scatter.pairs as u32, scatter.counts.pairs, scatter.quads as u32, done, n];
+                        list.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
                         list.Dispatch(n.div_ceil(64), 1, 1);
                         done += n;
                     }
@@ -325,5 +425,43 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scatter_packing_reduces_bytes_without_touching_unchanged_words() {
+        let input: Vec<u32> = (0..96).map(|i| i ^ 0xabba).collect();
+        // Disjoint runs: a byte copy, a quad with a tail, a gap, another
+        // quad, a singleton, and a large run that stays a direct copy.
+        let ranges = [(1, 3), (4, 28), (32, 48), (60, 64), (80, 356)];
+        for packed in [false, true] {
+            let counts = short_counts(&ranges, packed);
+            assert_eq!(counts.bytes(), if packed { 64 } else { 88 });
+            let mut pairs = vec![[0u32; 2]; counts.pairs as usize];
+            let mut quads = vec![[0u32; 5]; counts.quads as usize];
+            // SAFETY: valid source and packet arrays of exactly the
+            // computed size, including the zero-quad fallback.
+            unsafe {
+                pack_scatter(input.as_ptr().cast(), &ranges, packed, pairs.as_mut_ptr(), quads.as_mut_ptr());
+            }
+            let mut actual = vec![0; input.len()];
+            for [offset, word] in pairs {
+                actual[offset as usize / 4] = word;
+            }
+            for [offset, a, b, c, d] in quads {
+                let at = offset as usize / 4;
+                actual[at..at + 4].copy_from_slice(&[a, b, c, d]);
+            }
+            let mut expected = vec![0; input.len()];
+            for (from, to) in [(1, 7), (8, 12), (15, 16)] {
+                expected[from..to].copy_from_slice(&input[from..to]);
+            }
+            assert_eq!(actual, expected);
+        }
     }
 }

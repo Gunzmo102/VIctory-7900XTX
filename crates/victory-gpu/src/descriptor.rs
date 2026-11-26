@@ -342,13 +342,10 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
-        let mut parts: Vec<(usize, usize)> = Vec::new();
-        for (range_from, range_end) in taken {
-            let mut page = range_from & !(crate::watch::PAGE - 1);
-            while page < range_end {
-                parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
-                page += crate::watch::PAGE;
-            }
+        let mirrored_end = (start + u64::from(mirrored_count) * step).min(end) as usize;
+        let parts = mirror_parts(taken, mirrored_end);
+        if parts.is_empty() {
+            continue;
         }
         // A few pages a thread at a time: read, compared with what was last
         // seen there and sorted out, beside one another (14 ms a frame of one
@@ -561,6 +558,27 @@ pub(crate) fn sync_line(frames: f64) {
         split[3] / 1e6 / frames,
         split[4] / 1e6 / frames
     );
+}
+
+/// Cut tracked dirty ranges into disjoint read jobs, ignoring title slots
+/// beyond a capped host heap. Keep the write-watch accounting for the full
+/// title heap, so partial last pages do not stay dirty on every sync.
+#[cfg(windows)]
+fn mirror_parts(ranges: Vec<(usize, usize)>, mirrored_end: usize) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    for (from, to) in ranges {
+        let to = to.min(mirrored_end);
+        if from >= to {
+            continue;
+        }
+        let mut at = from;
+        while at < to {
+            let end = ((at | (crate::watch::PAGE - 1)) + 1).min(to);
+            parts.push((at, end));
+            at = end;
+        }
+    }
+    parts
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
@@ -1558,6 +1576,15 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn heap_sync_reads_no_bytes_beyond_the_host_limit() {
+        let page = crate::watch::PAGE;
+        let ranges = vec![(page + 32, 3 * page), (4 * page, 5 * page)];
+        assert_eq!(mirror_parts(ranges.clone(), 2 * page + 64), [(page + 32, 2 * page), (2 * page, 2 * page + 64)]);
+        assert!(mirror_parts(ranges, page).is_empty());
     }
 
     #[cfg(windows)]
